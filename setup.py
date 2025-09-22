@@ -7,7 +7,7 @@ here = pathlib.Path(__file__).parent.resolve()
 
 setup(
     name="PineTick",
-    version="0.0.6",
+    version="0.0.7",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     description="Placeholder package to reserve the name",
