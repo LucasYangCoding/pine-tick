@@ -1,15 +1,16 @@
 import functools
 import importlib
+import threading
 from datetime import datetime, timedelta, time
-from typing import Optional
+from typing import Optional, Tuple
 
 from apscheduler.executors.pool import ThreadPoolExecutor
 from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy import create_engine, Engine, exists
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 
 from pinetick.orm import Base, TickerLog
-from pinetick.utils import datetime_with_tz
+from pinetick.utils import datetime_with_tz, date_with_tz
 from pinetick.validate import ScheduleParams
 
 
@@ -18,7 +19,7 @@ class Ticker:
     def __init__(
             self,
             *,
-            database_url: str,
+            database_url: str = "sqlite:///pine_tick.db",
             engine: Optional[Engine] = None,
             session: Optional[sessionmaker] = None
     ):
@@ -26,69 +27,105 @@ class Ticker:
         self._database_url = database_url
         self._engine = create_engine(self._database_url, echo=False) if engine is None else engine
         self._session = sessionmaker(bind=self._engine) if session is None else session
+        self._scan_lock = threading.Lock()
         self._create_db()
 
     def _create_db(self):
         """初始化数据库"""
         Base.metadata.create_all(bind=self._engine)
 
+    @staticmethod
+    def _compute_trigger_and_start_at(
+            *,
+            params: Optional[ScheduleParams]=None,
+            task: Optional[TickerLog]=None
+    ) -> Tuple[str, datetime]:
+        if params is not None:
+            if params.interval is not None:
+                trigger = "interval"
+                start_at = datetime_with_tz() + timedelta(seconds=params.interval)
+            else:
+                trigger = "time"
+                start_at = datetime.combine(date_with_tz(), params.time_point)
+            return trigger, start_at
+        else:
+            if task.trigger == "interval":
+                start_at = datetime_with_tz() + (task.start_at - task.created_at)
+            else:
+                start_at = task.start_at + timedelta(days=1)
+            return "", start_at
+
     def schedule(
             self,
             *,
             interval: Optional[int] = None,
-            time_point: Optional[datetime] = None,
+            time_point: Optional[time] = None,
     ):
-        """定时任务"""
+        """定时任务
+        时间间隔：执行成功，更新执行时间。执行失败
+        时间点：
+        """
         params = ScheduleParams(interval=interval, time_point=time_point)
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
-                if params.interval is not None:
-                    executed_start_at = datetime_with_tz() + timedelta(seconds=params.interval)
-                else:
-                    executed_start_at = params.time_point
+                trigger, start_at = self._compute_trigger_and_start_at(params=params)
                 func_path = func.__module__ + '.' + func.__name__
                 with self._session.begin() as db:
                     if not db.query(exists().where(TickerLog.func_path == func_path)).scalar():
-                        ticker_log = TickerLog(executed_start_at=executed_start_at,
-                                               func_path=func_path, args=args, kwargs=kwargs)
-                        db.add(ticker_log)
+                        task = TickerLog(trigger=trigger, start_at=start_at,
+                                         func_path=func_path, args=args, kwargs=kwargs)
+                        db.add(task)
                 return func(*args, **kwargs)
             return wrapper
         return decorator
 
+    def _add_task(self, *, db: Session, task: Optional[TickerLog]):
+        """添加任务"""
+        _, start_at = self._compute_trigger_and_start_at(task=task)
+        t = TickerLog(created_at=datetime_with_tz(), trigger=task.trigger, start_at=start_at,
+                      func_path=task.func_path, args=task.args, kwargs=task.kwargs)
+        db.add(t)
+
+    @staticmethod
+    def _func(*, task: Optional[TickerLog]):
+        """获取函数"""
+        func_path, args, kwargs = task.func_path, task.args, task.kwargs
+        module_name, func_name = func_path.rsplit('.', 1)
+        module = importlib.import_module(module_name)
+        return getattr(module, func_name)
+
+    def _message(self, *, task: Optional[TickerLog]):
+        """执行函数"""
+        func = self._func(task=task)
+        return func(*(task.args or []), **(task.kwargs or {}))
+
+    def _job(self, *, task_id: int):
+        """任务"""
+        with self._session.begin() as db:
+            try:
+                task = db.get(TickerLog, task_id)
+                task.message = self._message(task=task)
+                task.status = "success"
+                self._add_task(db=db, task=task)
+            except Exception as e:
+                task.message = str(e)
+                task.status = "error"
+            finally:
+                task.end_at = datetime_with_tz()
+
+    def _scan_jobs(self, *, scheduler: BlockingScheduler):
+        """扫描数据库任务"""
+        with self._scan_lock:
+            with self._session.begin() as db:
+                tasks = db.query(TickerLog).filter(TickerLog.status.is_(None), TickerLog.is_scan.is_(False)).all()
+                for task in tasks:
+                    scheduler.add_job(self._job, "date", run_date=task.start_at, kwargs={"task_id": task.id})
+                    task.is_scan =  True
+
     def start(self):
         """启动"""
-        executors = {'default': ThreadPoolExecutor(max_workers=4)}
+        executors = {"default": ThreadPoolExecutor(max_workers=4)}
         scheduler = BlockingScheduler(executors=executors)
-        with self._session.begin() as db:
-            tasks = db.query(TickerLog).filter(TickerLog.status.is_(None)).all()
-            for task in tasks:
-                func_path, args, kwargs = task.func_path, task.args, task.kwargs
-                module_name, func_name = func_path.rsplit('.', 1)
-                module = importlib.import_module(module_name)
-                func = getattr(module, func_name)
-                def job(task_id = task.id):
-                    with self._session.begin() as inner_db:
-                        try:
-                            t = inner_db.get(TickerLog, task_id)
-                            message = func(*(t.args or []), **(t.kwargs or {}))
-                            print(message)
-                            t.message = message
-                            t.status = "success"
-                        except Exception as e:
-                            t.message = str(e)
-                            t.status = "error"
-                        finally:
-                            t.executed_end_at = datetime_with_tz()
-                scheduler.add_job(job, 'date', run_date=task.executed_start_at)
+        scheduler.add_job(self._scan_jobs, "interval", seconds=3, kwargs={"scheduler": scheduler})
         scheduler.start()
-
-
-if __name__ == '__main__':
-    ticker = Ticker(database_url='sqlite:///pine_tick.db')
-    @ticker.schedule(interval=10)
-    def test():
-        return 2
-    test()
-    ticker.start()

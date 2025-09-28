@@ -4,3 +4,6 @@ from zoneinfo import ZoneInfo
 
 def datetime_with_tz():
     return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+def date_with_tz():
+    return datetime_with_tz().date()

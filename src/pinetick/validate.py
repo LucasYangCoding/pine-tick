@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class ScheduleParams(BaseModel):
     interval: Optional[int] = Field(None, ge=1, description="interval")
-    time_point: Optional[datetime] = Field(None, description="time_point")
+    time_point: Optional[time] = Field(None, description="time_point")
 
     @model_validator(mode="after")
     def check_exclusive(self):
