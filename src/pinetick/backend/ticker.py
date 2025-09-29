@@ -4,14 +4,18 @@ import threading
 from datetime import datetime, timedelta, time
 from typing import Optional, Tuple
 
+import uvicorn
 from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.blocking import BlockingScheduler
+from fastapi import FastAPI, Request
 from sqlalchemy import create_engine, Engine, exists
 from sqlalchemy.orm import sessionmaker, Session
 
-from pinetick.orm import Base, TickerLog
-from pinetick.utils import datetime_with_tz, date_with_tz
-from pinetick.validate import ScheduleParams
+from pinetick.backend.api import router
+from pinetick.backend.orm import Base, TickerLog
+from pinetick.backend.utils import datetime_with_tz, date_with_tz
+from pinetick.backend.validate import ScheduleParams
 
 
 class Ticker:
@@ -19,7 +23,7 @@ class Ticker:
     def __init__(
             self,
             *,
-            database_url: str = "sqlite:///pine_tick.db",
+            database_url: str,
             engine: Optional[Engine] = None,
             session: Optional[sessionmaker] = None
     ):
@@ -28,7 +32,22 @@ class Ticker:
         self._engine = create_engine(self._database_url, echo=False) if engine is None else engine
         self._session = sessionmaker(bind=self._engine) if session is None else session
         self._scan_lock = threading.Lock()
+        self._app = FastAPI()
+        self._app.middleware("http")(self._db_middleware)
+        self._app.include_router(router)
         self._create_db()
+
+    async def _db_middleware(self, request: Request, call_next):
+        request.state.db = self._session()
+        try:
+            response = await call_next(request)
+            request.state.db.commit()
+        except Exception as e:
+            request.state.db.rollback()
+            raise e
+        finally:
+            request.state.db.close()
+        return response
 
     def _create_db(self):
         """初始化数据库"""
@@ -69,10 +88,10 @@ class Ticker:
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
-                trigger, start_at = self._compute_trigger_and_start_at(params=params)
                 func_path = func.__module__ + '.' + func.__name__
                 with self._session.begin() as db:
                     if not db.query(exists().where(TickerLog.func_path == func_path)).scalar():
+                        trigger, start_at = self._compute_trigger_and_start_at(params=params)
                         task = TickerLog(trigger=trigger, start_at=start_at,
                                          func_path=func_path, args=args, kwargs=kwargs)
                         db.add(task)
@@ -126,6 +145,24 @@ class Ticker:
     def start(self):
         """启动"""
         executors = {"default": ThreadPoolExecutor(max_workers=4)}
-        scheduler = BlockingScheduler(executors=executors)
+        # scheduler = BlockingScheduler(executors=executors)
+        scheduler = BackgroundScheduler(executors=executors)
         scheduler.add_job(self._scan_jobs, "interval", seconds=3, kwargs={"scheduler": scheduler})
         scheduler.start()
+        uvicorn.run(self._app, host="0.0.0.0", port=8000)
+
+
+if __name__ == "__main__":
+    user, password, host, port, db = "pine_tick", "password", "localhost", "25432", "pine_tick"
+    ticker = Ticker(database_url=f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}")
+    @ticker.schedule(interval=10)
+    def test1():
+        return "test1"
+
+    @ticker.schedule(interval=10)
+    def test2():
+        return "test2"
+
+    test1()
+    test2()
+    ticker.start()

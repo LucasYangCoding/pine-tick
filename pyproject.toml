@@ -11,7 +11,10 @@ requires-python = ">=3.9"
 dependencies = [
     "sqlalchemy (>=2.0.43,<3.0.0)",
     "pydantic (>=2.11.9,<3.0.0)",
-    "apscheduler (>=3.11.0,<4.0.0)"
+    "apscheduler (>=3.11.0,<4.0.0)",
+    "psycopg2-binary (>=2.9.10,<3.0.0)",
+    "fastapi (>=0.117.1,<0.118.0)",
+    "uvicorn[standard] (>=0.37.0,<0.38.0)"
 ]
 
 

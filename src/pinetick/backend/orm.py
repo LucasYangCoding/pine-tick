@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, DateTime, String, JSON, Boolean
 from sqlalchemy.orm import declarative_base
 
-from pinetick.utils import datetime_with_tz
+from pinetick.backend.utils import datetime_with_tz
 
 Base = declarative_base()
 
